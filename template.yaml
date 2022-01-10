@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Basic application showing failure handling across a range of serveless services
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+    Tracing: Active
+    # https://awslabs.github.io/aws-lambda-powertools-python/latest/
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:4
+    Environment:
+      Variables:
+        POWERTOOLS_METRICS_NAMESPACE: FailureModes
+        ENVIRONMENT_NAME: !Sub '${Environment}'
+        LOG_LEVEL: INFO
+  Api:
+    TracingEnabled: True
+    OpenApiVersion: 3.0.1
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  NotificationEmail:
+    Type: String
+
+Resources:
+
+  PublicApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Sub '${Environment}'
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Protocol: email
+        Endpoint: !Ref NotificationEmail
+
+  APILambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/api/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SQSQueue.QueueName
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - KinesisCrudPolicy:
+            StreamName: !Ref KinesisStream
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: AllAtOnce # Canary10Percent10Minutes -  TODO: Revert back when done
+        Alarms: # A list of alarms that you want to monitor during deployment
+          - !Ref APILambdaAliasErrorAlarm
+          - !Ref APILambdaLatestVersionErrorAlarm
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: !Sub '${Environment}-api'
+          DYNAMO_TABLE: !Ref DynamoDBTable
+          EVENT_BUS_NAME: !Ref EventBus
+          SQS_QUEUE_URL: !Ref SQSQueue
+          KINESIS_STREAM_NAME: !Ref KinesisStream
+      Events:
+        ProxyApiGreedy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PublicApi
+            Path: /{proxy+}
+            Method: ANY
+
+  APILambdaAliasErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${APILambda}:live"
+        - Name: FunctionName
+          Value: !Ref APILambda
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  APILambdaLatestVersionErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${APILambda}:live"
+        - Name: FunctionName
+          Value: !Ref APILambda
+        - Name: ExecutedVersion
+          Value: !GetAtt APILambda.Version.Version
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - AttributeName: id
+          AttributeType: S
+      KeySchema: 
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  DynamoStreamDLQ:
+    Type: AWS::SQS::Queue
+
+  DynamoStreamDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: "AWS/SQS"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DynamoStreamDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - Ref: AlarmTopic
+
+  DynamoLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/dynamo_stream/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies: 
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DynamoStreamDLQ.QueueName
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Alarms: # A list of alarms that you want to monitor during deployment
+          - !Ref DynamoLambdaAliasErrorAlarm
+          - !Ref DynamoLambdaLatestVersionErrorAlarm
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: !Sub '${Environment}-dynamostream'
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            BisectBatchOnFunctionError: false
+            DestinationConfig:
+              OnFailure: 
+                Destination: !GetAtt DynamoStreamDLQ.Arn
+            FunctionResponseTypes: 
+              - ReportBatchItemFailures
+            MaximumRecordAgeInSeconds: 600
+            MaximumRetryAttempts: 2
+            StartingPosition: TRIM_HORIZON
+            Stream: !GetAtt DynamoDBTable.StreamArn
+
+  DynamoLambdaAliasErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${DynamoLambda}:live"
+        - Name: FunctionName
+          Value: !Ref DynamoLambda
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  DynamoLambdaLatestVersionErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${DynamoLambda}:live"
+        - Name: FunctionName
+          Value: !Ref DynamoLambda
+        - Name: ExecutedVersion
+          Value: !GetAtt DynamoLambda.Version.Version
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties: 
+      Name: !Sub "events-${Environment}"
+
+  EventbridgeDLQ:
+    Type: AWS::SQS::Queue
+
+  EventbridgeDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: "AWS/SQS"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventbridgeDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - Ref: AlarmTopic
+
+  AsyncLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/async/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Alarms: # A list of alarms that you want to monitor during deployment
+          - !Ref AsyncLambdaAliasErrorAlarm
+          - !Ref AsyncLambdaLatestVersionErrorAlarm
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: !Sub '${Environment}-async'
+      Policies: 
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AsyncLambdaDLQ.QueueName
+      EventInvokeConfig:
+        MaximumEventAgeInSeconds: 300
+        MaximumRetryAttempts: 1
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt AsyncLambdaDLQ.Arn
+      Events:
+        EBRule:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern: # This pattern will match all events
+              source:
+                - prefix: ''
+            RetryPolicy:
+              MaximumRetryAttempts: 1
+              MaximumEventAgeInSeconds: 300
+            DeadLetterConfig:
+              Arn: !GetAtt EventbridgeDLQ.Arn
+            Target:
+              Id: !Sub '${Environment}-async-target'
+
+  AsyncLambdaDLQ:
+    Type: AWS::SQS::Queue
+
+  AsyncLambdaDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: "AWS/SQS"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AsyncLambdaDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - Ref: AlarmTopic
+
+  AsyncLambdaAliasErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${AsyncLambda}:live"
+        - Name: FunctionName
+          Value: !Ref AsyncLambda
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  AsyncLambdaLatestVersionErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${AsyncLambda}:live"
+        - Name: FunctionName
+          Value: !Ref AsyncLambda
+        - Name: ExecutedVersion
+          Value: !GetAtt AsyncLambda.Version.Version
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  SQSDLQ:
+    Type: AWS::SQS::Queue
+
+  SQSDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: "AWS/SQS"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SQSDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - Ref: AlarmTopic
+
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      RedrivePolicy: 
+        deadLetterTargetArn: !GetAtt SQSDLQ.Arn
+        maxReceiveCount: 2
+
+  SQSLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/sqs/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Alarms: # A list of alarms that you want to monitor during deployment
+          - !Ref SQSLambdaAliasErrorAlarm
+          - !Ref SQSLambdaLatestVersionErrorAlarm
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: !Sub '${Environment}-sqsevent'
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SQSQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: 
+              - ReportBatchItemFailures
+
+  SQSLambdaAliasErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${SQSLambda}:live"
+        - Name: FunctionName
+          Value: !Ref SQSLambda
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  SQSLambdaLatestVersionErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${SQSLambda}:live"
+        - Name: FunctionName
+          Value: !Ref SQSLambda
+        - Name: ExecutedVersion
+          Value: !GetAtt SQSLambda.Version.Version
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+  
+  KinesisDLQ:
+    Type: AWS::SQS::Queue
+
+  KinesisDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: "AWS/SQS"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt KinesisDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - Ref: AlarmTopic
+
+  KinesisStream: 
+    Type: AWS::Kinesis::Stream 
+    Properties: 
+      ShardCount: 1
+
+  KinesisLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/kinesis_stream/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies: 
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt KinesisDLQ.QueueName
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Alarms: # A list of alarms that you want to monitor during deployment
+          - !Ref KinesisLambdaAliasErrorAlarm
+          - !Ref KinesisLambdaLatestVersionErrorAlarm
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: !Sub '${Environment}-kinesislambda'
+      Events:
+        KinesisEvent:
+          Type: Kinesis
+          Properties:
+            BisectBatchOnFunctionError: false
+            DestinationConfig:
+              OnFailure: 
+                Destination: !GetAtt KinesisDLQ.Arn
+            FunctionResponseTypes: 
+              - ReportBatchItemFailures
+            MaximumRecordAgeInSeconds: 600
+            MaximumRetryAttempts: 2
+            StartingPosition: TRIM_HORIZON
+            Stream: !GetAtt KinesisStream.Arn
+  
+  KinesisLambdaAliasErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${KinesisLambda}:live"
+        - Name: FunctionName
+          Value: !Ref KinesisLambda
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  KinesisLambdaLatestVersionErrorAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmActions:
+        - !Ref AlarmTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub "${KinesisLambda}:live"
+        - Name: FunctionName
+          Value: !Ref KinesisLambda
+        - Name: ExecutedVersion
+          Value: !GetAtt KinesisLambda.Version.Version
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL."
+    Value: !Sub "https://${PublicApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
