@@ -48,3 +48,11 @@ python3 test.py
 ```
 
 Note that the script `test.py` depends upon `samconfig.toml` created during the deployment steps.
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
